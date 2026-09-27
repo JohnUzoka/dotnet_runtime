@@ -19,11 +19,16 @@ namespace System.Net.Sockets
             1024;
 #endif
 
+        // System.Console is referenced only in Debug (see System.Net.Sockets.csproj).
+#if DEBUG
         private static bool Logging;
+#endif
         private static void Log(string str)
         {
+#if DEBUG
             if (Logging)
                 Console.WriteLine(str);
+#endif
         }
 
         // Socket continuations are dispatched to the ThreadPool from the event thread.
