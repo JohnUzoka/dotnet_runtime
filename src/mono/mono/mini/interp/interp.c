@@ -1038,7 +1038,29 @@ interp_throw (ThreadContext *context, MonoException *ex, InterpFrame *frame, con
 	mono_handle_exception (&ctx, (MonoObject*)ex);
 
 	if (MONO_CONTEXT_GET_IP (&ctx) != 0) {
-		/* We need to unwind into non-interpreter code */
+		/* We need to unwind into non-interpreter code.
+		 * mono_restore_context will jump directly to the compiled catch handler,
+		 * bypassing the epilogue of interp_entry / interp_entry_from_trampoline.
+		 * Restore context->stack_pointer to the root frame of this interpreter
+		 * invocation and pop frame data allocators to prevent leaking stack space. */
+		InterpFrame *f = frame;
+		while (f) {
+			frame_data_allocator_pop (&context->data_stack, f);
+			if (!f->parent)
+				break;
+			f = f->parent;
+		}
+		if (f) {
+			memset (f->stack, 0, (guint8*)context->stack_pointer - (guint8*)f->stack);
+			context->stack_pointer = (guchar*)f->stack;
+		}
+		if (context->exc_gchandle) {
+			mono_gchandle_free_internal (context->exc_gchandle);
+			context->exc_gchandle = 0;
+		}
+		context->has_resume_state = FALSE;
+		context->handler_frame = NULL;
+		context->handler_ei = NULL;
 		mono_restore_context (&ctx);
 		g_assert_not_reached ();
 	}
