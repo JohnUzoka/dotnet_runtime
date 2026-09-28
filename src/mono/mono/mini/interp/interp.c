@@ -1039,28 +1039,57 @@ interp_throw (ThreadContext *context, MonoException *ex, InterpFrame *frame, con
 
 	if (MONO_CONTEXT_GET_IP (&ctx) != 0) {
 		/* We need to unwind into non-interpreter code.
-		 * mono_restore_context will jump directly to the compiled catch handler,
-		 * bypassing the epilogue of interp_entry / interp_entry_from_trampoline.
-		 * Restore context->stack_pointer to the root frame of this interpreter
-		 * invocation and pop frame data allocators to prevent leaking stack space. */
-		InterpFrame *f = frame;
-		while (f) {
-			frame_data_allocator_pop (&context->data_stack, f);
-			if (!f->parent)
+		 * mono_restore_context will jump directly to the target native context,
+		 * bypassing the normal return epilogue of interp_entry / interp_entry_from_trampoline.
+		 * Determine the target stack pointer:
+		 * - If catching in an enclosing interpreter frame (context->has_resume_state is TRUE
+		 *   and context->handler_frame != NULL), preserve the active resume state and unwind
+		 *   only younger frames down to context->handler_frame.
+		 * - If catching in compiled code, find the youngest still-live interpreter frame from
+		 *   the unwound LMF stack (mono_get_lmf()). If none remain, restore to the base of the
+		 *   interpreter stack. All abandoned frames across any intermediate invocations are cleaned up. */
+		guchar *target_sp;
+		if (context->has_resume_state && context->handler_frame) {
+			target_sp = (guchar*)context->handler_frame->stack + context->handler_frame->imethod->alloca_size;
+		} else {
+			MonoLMF *l = mono_get_lmf ();
+			InterpFrame *live_interp_frame = NULL;
+			while (l) {
+				if ((gsize)l->previous_lmf & 2) {
+					MonoLMFExt *ext = (MonoLMFExt*)l;
+					if (ext->kind == MONO_LMFEXT_INTERP_EXIT || ext->kind == MONO_LMFEXT_INTERP_EXIT_WITH_CTX) {
+						live_interp_frame = (InterpFrame*)ext->interp_exit_data;
+						break;
+					}
+				}
+				l = (MonoLMF*)((gsize)l->previous_lmf & ~3);
+			}
+			if (live_interp_frame)
+				target_sp = (guchar*)live_interp_frame->stack + live_interp_frame->imethod->alloca_size;
+			else
+				target_sp = context->stack_start + MINT_STACK_ALIGNMENT;
+
+			context->has_resume_state = FALSE;
+			context->handler_frame = NULL;
+			context->handler_ei = NULL;
+		}
+
+		/* Pop data stack allocations belonging to abandoned frames */
+		while (context->data_stack.infos_len > 0) {
+			InterpFrame *info_frame = context->data_stack.infos [context->data_stack.infos_len - 1].frame;
+			if (info_frame && (guchar*)info_frame->stack >= target_sp) {
+				frame_data_allocator_pop (&context->data_stack, info_frame);
+			} else {
 				break;
-			f = f->parent;
+			}
 		}
-		if (f) {
-			memset (f->stack, 0, (guint8*)context->stack_pointer - (guint8*)f->stack);
-			context->stack_pointer = (guchar*)f->stack;
+
+		/* Zero abandoned stack space and reset the execution stack pointer */
+		if ((guchar*)context->stack_pointer > target_sp) {
+			memset (target_sp, 0, (guchar*)context->stack_pointer - target_sp);
+			context->stack_pointer = target_sp;
 		}
-		if (context->exc_gchandle) {
-			mono_gchandle_free_internal (context->exc_gchandle);
-			context->exc_gchandle = 0;
-		}
-		context->has_resume_state = FALSE;
-		context->handler_frame = NULL;
-		context->handler_ei = NULL;
+
 		mono_restore_context (&ctx);
 		g_assert_not_reached ();
 	}
