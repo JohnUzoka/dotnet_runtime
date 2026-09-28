@@ -198,21 +198,29 @@ static void free_range(void* start, size_t length) {
 	set_page_group_state(start_page, page_count, 0);
 }
 
-static int next_aligned_index(int start_index, int alignment) {
+// First page index >= start_index whose absolute address is aligned to `alignment` bytes
+// (a power of two >= MMAP_PAGE_SIZE, or 0 for page alignment). Alignment is relative to
+// the address, not to heap_start: the heap is only guaranteed 4 MB-aligned (heap.c), so
+// page-index alignment broke larger requests such as SGen's 16 MB nursery.
+static int next_aligned_index(int start_index, size_t alignment) {
 	if (alignment == 0) return start_index;
-	int remainder = start_index % alignment;
-	if (remainder == 0) return start_index;
-	return start_index + (alignment - remainder);
+	uintptr_t addr = (uintptr_t)heap_start + (uintptr_t)start_index * MMAP_PAGE_SIZE;
+	uintptr_t aligned = (addr + alignment - 1) & ~(uintptr_t)(alignment - 1);
+	return (int)((aligned - (uintptr_t)heap_start) / MMAP_PAGE_SIZE);
 }
 
-static void* alloc_range(size_t length, int page_index_align) {
+static int is_aligned_index(int index, size_t alignment) {
+	return alignment == 0 || (((uintptr_t)heap_start + (uintptr_t)index * MMAP_PAGE_SIZE) & (alignment - 1)) == 0;
+}
+
+static void* alloc_range(size_t length, size_t alignment) {
 	if (length == 0) return NULL;
 
 	size_t pages_needed = (length + MMAP_PAGE_SIZE - 1) / MMAP_PAGE_SIZE;
-	int first_free = find_first_page_of(next_aligned_index(0, page_index_align), total_pages, 0);
+	int first_free = find_first_page_of(next_aligned_index(0, alignment), total_pages, 0);
 	while (first_free >= 0) 
 	{
-		if (page_index_align == 0 || first_free % page_index_align == 0) 
+		if (is_aligned_index(first_free, alignment)) 
 		{
 			int consecutive_pages = count_consecutive_pages(first_free, pages_needed, NULL);
 
@@ -225,7 +233,7 @@ static void* alloc_range(size_t length, int page_index_align) {
 		}
 		else
 		{
-			first_free = find_first_page_of(next_aligned_index(first_free + 1, page_index_align), total_pages, 0);
+			first_free = find_first_page_of(next_aligned_index(first_free + 1, alignment), total_pages, 0);
 		}
 	}
 	
@@ -281,20 +289,21 @@ mono_valloc_aligned (size_t size, size_t alignment, int flags, MonoMemAccountTyp
 	if (alignment & (alignment - 1))
 		g_error ("mono_valloc_aligned: alignment %zu is not a power of two", alignment);
 
-	int page_alignment = 0;
+	// alloc_range aligns to the absolute address; alignment <= page size needs no extra work.
+	size_t byte_alignment = 0;
 	if (alignment > MMAP_PAGE_SIZE)
 	{
 		if (alignment % MMAP_PAGE_SIZE != 0)
 			g_error ("mono_valloc_aligned: alignment %zu is not a multiple of page size %d", alignment, MMAP_PAGE_SIZE);
 
-		page_alignment = alignment / MMAP_PAGE_SIZE;
+		byte_alignment = alignment;
 	}
 
 	// In case alignment is less use alignment = 0, which means single page-aligned allocation
 
 	void* ptr = NULL;
 	BEGIN_CRITICAL_SECTION;
-	ptr = alloc_range (size, page_alignment);
+	ptr = alloc_range (size, byte_alignment);
 	END_CRITICAL_SECTION;
 
 	if (!ptr) return NULL;
