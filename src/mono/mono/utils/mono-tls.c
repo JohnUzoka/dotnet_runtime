@@ -236,7 +236,9 @@ static void tls_thread_destructor(void* data)
 		if (!(g_my_key_bitmap & KEY(i)))
 			continue;
 
-		// If this thread does not use this key, skip it
+		// If this thread holds no value for this key, skip it. As with POSIX TLS, a key
+		// set back to NULL (e.g. mono detached the thread before exiting) must not run its
+		// destructor: thread_info_key_dtor asserts on NULL (unregister_thread).
 		if (!(tls->bitmap & KEY(i)))
 			continue;
 
@@ -328,7 +330,12 @@ int mono_native_tls_set_value (MonoNativeTlsKey key, gpointer value)
 
 	emulated_tls_data* data = fake_tls_get();
 	data->items[key] = value;
-	data->bitmap |= KEY(key);
+	// The bitmap tracks keys holding a non-NULL value, so the destructor loop matches
+	// pthread semantics and a destructor may re-set then clear its own key.
+	if (value)
+		data->bitmap |= KEY(key);
+	else
+		data->bitmap &= ~KEY(key);
 	return 1;
 }
 
