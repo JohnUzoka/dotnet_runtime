@@ -1258,6 +1258,67 @@ int32_t SystemNative_Rename(const char* oldPath, const char* newPath)
 {
     int32_t result;
     while ((result = rename(oldPath, newPath)) < 0 && errno == EINTR);
+#if defined(TARGET_LIBNX)
+    if (result < 0 && errno == EEXIST)
+    {
+        // On libnx/Horizon FS, rename() fails with EEXIST if newPath already exists.
+        // In POSIX, rename() atomically replaces newPath if both are regular files.
+        struct stat_ oldStat, newStat;
+        int oldStatRet, newStatRet;
+        while ((oldStatRet = stat_(oldPath, &oldStat)) < 0 && errno == EINTR);
+        while ((newStatRet = stat_(newPath, &newStat)) < 0 && errno == EINTR);
+        if (oldStatRet == 0 && newStatRet == 0 && !S_ISDIR(oldStat.st_mode) && !S_ISDIR(newStat.st_mode))
+        {
+            static volatile int s_tempCounter = 0;
+            char tempPath[1024];
+            int tempMoved = 0;
+            int origErrno = EEXIST;
+
+            for (int attempt = 0; attempt < 100; attempt++)
+            {
+                int c = __atomic_add_fetch(&s_tempCounter, 1, __ATOMIC_RELAXED);
+                int written = snprintf(tempPath, sizeof(tempPath), "%s.tmp%d_%d", newPath, (int)getpid(), c);
+                if (written <= 0 || (size_t)written >= sizeof(tempPath))
+                {
+                    errno = ENAMETOOLONG;
+                    return -1;
+                }
+
+                int moveTempRet;
+                while ((moveTempRet = rename(newPath, tempPath)) < 0 && errno == EINTR);
+                if (moveTempRet == 0)
+                {
+                    tempMoved = 1;
+                    break;
+                }
+                if (errno != EEXIST)
+                {
+                    return -1;
+                }
+            }
+
+            if (!tempMoved)
+            {
+                errno = EEXIST;
+                return -1;
+            }
+
+            int moveSrcRet;
+            while ((moveSrcRet = rename(oldPath, newPath)) < 0 && errno == EINTR);
+            if (moveSrcRet == 0)
+            {
+                while (unlink(tempPath) < 0 && errno == EINTR);
+                return 0;
+            }
+
+            origErrno = errno;
+            int restoreRet;
+            while ((restoreRet = rename(tempPath, newPath)) < 0 && errno == EINTR);
+            errno = origErrno;
+            return -1;
+        }
+    }
+#endif
     return result;
 }
 
@@ -1495,7 +1556,11 @@ int32_t SystemNative_CopyFile(intptr_t sourceFd, intptr_t destinationFd, int64_t
     // to be owned by root. If we aren't running as root, then we won't be an owner of our new file, and
     // attempting to copy metadata to it will fail with EPERM. We have copied successfully, we just can't
     // copy metadata. The best thing we can do is skip copying the metadata.
+#if defined(TARGET_LIBNX)
+    if (ret != 0 && errno != EPERM && errno != ENOSYS)
+#else
     if (ret != 0 && errno != EPERM)
+#endif
     {
         return -1;
     }
@@ -1505,7 +1570,11 @@ int32_t SystemNative_CopyFile(intptr_t sourceFd, intptr_t destinationFd, int64_t
     // Even though managed code created the file with permissions matching those of the source file,
     // we need to copy permissions because the open permissions may be filtered by 'umask'.
     while ((ret = fchmod(outFd, sourceStat.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO))) < 0 && errno == EINTR);
+#if defined(TARGET_LIBNX)
+    if (ret != 0 && errno != EPERM && errno != ENOSYS) // See EPERM comment above; on libnx fchmod is stub returning ENOSYS
+#else
     if (ret != 0 && errno != EPERM) // See EPERM comment above
+#endif
     {
         return -1;
     }
